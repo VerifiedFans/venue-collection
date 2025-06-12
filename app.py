@@ -1,19 +1,27 @@
+
 import os
 import json
 import time
 import math
 import re
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import logging
-import uuid
-import hashlib
+import asyncio
+from urllib.parse import urljoin, urlparse
 
-from flask import Flask, request, jsonify, render_template_string, redirect, session
+from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 import requests
 from dataclasses import dataclass, asdict
 from bs4 import BeautifulSoup
+import selenium
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -21,31 +29,19 @@ logger = logging.getLogger(__name__)
 
 # Initialize Flask app
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'venuemapper-pro-2025')
 CORS(app)
 
 @dataclass
-class User:
-    id: str
-    email: str
-    name: str
-    plan: str  # free, pro, enterprise
-    api_requests: int
-    created_at: str
-    api_key: str = ""
-
-@dataclass
-class Venue:
-    name: str
+class Show:
+    artist: str
+    venue_name: str
     address: str
     city: str
     state: str
     country: str
-    latitude: float
-    longitude: float
     date: str
-    artist: str = ""
-    user_id: str = ""
+    latitude: float = 0.0
+    longitude: float = 0.0
     venue_polygon: Optional[Dict] = None
     parking_polygons: List[Dict] = None
     
@@ -61,11 +57,430 @@ class ParkingArea:
     longitude: float
     place_id: str = ""
 
-# In-memory storage (use database in production)
-users_db = {}
-venues_db = {}
-artist_submissions = {}
-usage_stats = {"total_venues": 0, "total_users": 0, "total_requests": 0}
+class BandsinTownScraper:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        })
+        self.driver = None
+        self._setup_driver()
+    
+    def _setup_driver(self):
+        """Setup Selenium WebDriver for dynamic content"""
+        try:
+            chrome_options = Options()
+            chrome_options.add_argument('--headless')
+            chrome_options.add_argument('--no-sandbox')
+            chrome_options.add_argument('--disable-dev-shm-usage')
+            chrome_options.add_argument('--disable-gpu')
+            chrome_options.add_argument('--window-size=1920,1080')
+            chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+            
+            # Try to initialize driver (will work in environments with Chrome)
+            try:
+                self.driver = webdriver.Chrome(options=chrome_options)
+                logger.info("Selenium WebDriver initialized successfully")
+            except Exception as e:
+                logger.warning(f"Selenium not available, falling back to requests: {e}")
+                self.driver = None
+        except Exception as e:
+            logger.error(f"Failed to setup WebDriver: {e}")
+            self.driver = None
+    
+    def scrape_artist_shows(self, artist_url: str, load_all_dates: bool = True) -> List[Dict]:
+        """Scrape all shows from a Bandsintown artist page"""
+        try:
+            logger.info(f"Scraping artist shows from: {artist_url}")
+            
+            if self.driver:
+                return self._scrape_with_selenium(artist_url, load_all_dates)
+            else:
+                return self._scrape_with_requests(artist_url)
+                
+        except Exception as e:
+            logger.error(f"Error scraping {artist_url}: {e}")
+            return []
+    
+    def _scrape_with_selenium(self, artist_url: str, load_all_dates: bool) -> List[Dict]:
+        """Scrape using Selenium for dynamic content"""
+        shows = []
+        
+        try:
+            self.driver.get(artist_url)
+            time.sleep(3)
+            
+            # Get artist name
+            artist_name = self._extract_artist_name_selenium()
+            
+            if load_all_dates:
+                # Click "Show more dates" until no more shows load
+                self._load_all_dates_selenium()
+            
+            # Extract all show elements
+            show_elements = self.driver.find_elements(By.CSS_SELECTOR, 
+                '.event-item, .show-item, [data-testid*="event"], .event-card, .concert-item')
+            
+            logger.info(f"Found {len(show_elements)} potential show elements")
+            
+            for element in show_elements:
+                show_data = self._extract_show_data_selenium(element, artist_name)
+                if show_data:
+                    shows.append(show_data)
+            
+            # Fallback: try different selectors
+            if not shows:
+                shows = self._extract_shows_fallback_selenium(artist_name)
+            
+        except Exception as e:
+            logger.error(f"Selenium scraping error: {e}")
+        
+        return shows
+    
+    def _scrape_with_requests(self, artist_url: str) -> List[Dict]:
+        """Fallback scraping with requests"""
+        shows = []
+        
+        try:
+            response = self.session.get(artist_url, timeout=10)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            artist_name = self._extract_artist_name_bs4(soup)
+            
+            # Look for show data in various formats
+            show_elements = soup.find_all(['div', 'li'], class_=re.compile(r'event|show|concert', re.I))
+            
+            for element in show_elements:
+                show_data = self._extract_show_data_bs4(element, artist_name)
+                if show_data:
+                    shows.append(show_data)
+            
+            # Try to find JSON data in script tags
+            script_shows = self._extract_json_shows(soup, artist_name)
+            shows.extend(script_shows)
+            
+        except Exception as e:
+            logger.error(f"Requests scraping error: {e}")
+        
+        return shows
+    
+    def _load_all_dates_selenium(self):
+        """Click 'Show more dates' button repeatedly to load all shows"""
+        max_clicks = 20  # Prevent infinite loops
+        clicks = 0
+        
+        while clicks < max_clicks:
+            try:
+                # Look for various "show more" button selectors
+                show_more_selectors = [
+                    'button[data-testid*="show-more"]',
+                    'button:contains("Show more")',
+                    'button:contains("Load more")',
+                    'button:contains("See more")',
+                    '.show-more-btn',
+                    '.load-more',
+                    '[data-action="load-more"]'
+                ]
+                
+                button_found = False
+                for selector in show_more_selectors:
+                    try:
+                        button = WebDriverWait(self.driver, 2).until(
+                            EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                        )
+                        self.driver.execute_script("arguments[0].click();", button)
+                        button_found = True
+                        clicks += 1
+                        logger.info(f"Clicked 'show more' button {clicks} times")
+                        time.sleep(2)  # Wait for content to load
+                        break
+                    except (TimeoutException, NoSuchElementException):
+                        continue
+                
+                if not button_found:
+                    logger.info("No more 'show more' buttons found")
+                    break
+                    
+            except Exception as e:
+                logger.info(f"Finished loading dates after {clicks} clicks: {e}")
+                break
+    
+    def _extract_artist_name_selenium(self) -> str:
+        """Extract artist name using Selenium"""
+        try:
+            # Try various selectors for artist name
+            selectors = [
+                'h1[data-testid*="artist"]',
+                'h1.artist-name',
+                '.artist-header h1',
+                'h1',
+                '[data-testid="artist-name"]'
+            ]
+            
+            for selector in selectors:
+                try:
+                    element = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    name = element.text.strip()
+                    if name and len(name) > 2:
+                        return name
+                except:
+                    continue
+            
+            # Fallback: extract from URL or page title
+            return self._extract_artist_from_url_or_title()
+            
+        except Exception as e:
+            logger.warning(f"Could not extract artist name: {e}")
+            return "Unknown Artist"
+    
+    def _extract_artist_name_bs4(self, soup) -> str:
+        """Extract artist name using BeautifulSoup"""
+        try:
+            # Try various selectors
+            selectors = ['h1', '.artist-name', '[data-testid*="artist"]']
+            
+            for selector in selectors:
+                element = soup.select_one(selector)
+                if element and element.get_text(strip=True):
+                    name = element.get_text(strip=True)
+                    if len(name) > 2:
+                        return name
+            
+            return self._extract_artist_from_url_or_title()
+            
+        except Exception as e:
+            logger.warning(f"Could not extract artist name: {e}")
+            return "Unknown Artist"
+    
+    def _extract_artist_from_url_or_title(self) -> str:
+        """Extract artist name from URL or page title"""
+        try:
+            if self.driver:
+                url = self.driver.current_url
+                title = self.driver.title
+            else:
+                url = ""
+                title = ""
+            
+            # Extract from URL pattern: /a/12345-artist-name
+            url_match = re.search(r'/a/\d+-(.+)', url)
+            if url_match:
+                artist_name = url_match.group(1).replace('-', ' ').title()
+                return artist_name
+            
+            # Extract from title
+            if title and 'Bandsintown' in title:
+                artist_name = title.replace('Bandsintown', '').strip(' -|')
+                return artist_name
+                
+            return "Unknown Artist"
+            
+        except Exception as e:
+            return "Unknown Artist"
+    
+    def _extract_show_data_selenium(self, element, artist_name: str) -> Optional[Dict]:
+        """Extract show data from a Selenium WebElement"""
+        try:
+            # Extract venue name
+            venue_selectors = ['.venue-name', '.location-name', '[data-testid*="venue"]']
+            venue_name = self._find_text_by_selectors(element, venue_selectors)
+            
+            # Extract date
+            date_selectors = ['.event-date', '.date', '[data-testid*="date"]', 'time']
+            date_text = self._find_text_by_selectors(element, date_selectors)
+            
+            # Extract location
+            location_selectors = ['.location', '.venue-location', '.address', '[data-testid*="location"]']
+            location_text = self._find_text_by_selectors(element, location_selectors)
+            
+            if venue_name and (date_text or location_text):
+                return {
+                    'artist': artist_name,
+                    'venue_name': venue_name,
+                    'raw_location': location_text or '',
+                    'raw_date': date_text or '',
+                    'source_url': self.driver.current_url if self.driver else ''
+                }
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Error extracting show data: {e}")
+            return None
+    
+    def _extract_show_data_bs4(self, element, artist_name: str) -> Optional[Dict]:
+        """Extract show data from a BeautifulSoup element"""
+        try:
+            # Similar extraction logic for BeautifulSoup
+            venue_name = self._find_text_in_element(element, [
+                '.venue-name', '.location-name', 'h3', 'h4'
+            ])
+            
+            date_text = self._find_text_in_element(element, [
+                '.event-date', '.date', 'time', '.datetime'
+            ])
+            
+            location_text = self._find_text_in_element(element, [
+                '.location', '.venue-location', '.address'
+            ])
+            
+            if venue_name and (date_text or location_text):
+                return {
+                    'artist': artist_name,
+                    'venue_name': venue_name,
+                    'raw_location': location_text or '',
+                    'raw_date': date_text or '',
+                    'source_url': ''
+                }
+            
+            return None
+            
+        except Exception as e:
+            return None
+    
+    def _find_text_by_selectors(self, element, selectors: List[str]) -> str:
+        """Find text using multiple selectors with Selenium"""
+        for selector in selectors:
+            try:
+                sub_element = element.find_element(By.CSS_SELECTOR, selector)
+                text = sub_element.text.strip()
+                if text:
+                    return text
+            except:
+                continue
+        return ""
+    
+    def _find_text_in_element(self, element, selectors: List[str]) -> str:
+        """Find text using multiple selectors with BeautifulSoup"""
+        for selector in selectors:
+            try:
+                sub_element = element.select_one(selector)
+                if sub_element:
+                    text = sub_element.get_text(strip=True)
+                    if text:
+                        return text
+            except:
+                continue
+        return ""
+    
+    def _extract_json_shows(self, soup, artist_name: str) -> List[Dict]:
+        """Extract show data from JSON in script tags"""
+        shows = []
+        
+        try:
+            # Look for JSON data in script tags
+            scripts = soup.find_all('script', type='application/json')
+            scripts.extend(soup.find_all('script', string=re.compile(r'events|shows|concerts')))
+            
+            for script in scripts:
+                try:
+                    if script.string:
+                        # Try to parse JSON
+                        data = json.loads(script.string)
+                        # Process JSON data to extract shows
+                        json_shows = self._process_json_data(data, artist_name)
+                        shows.extend(json_shows)
+                except:
+                    continue
+                    
+        except Exception as e:
+            logger.debug(f"Error extracting JSON shows: {e}")
+        
+        return shows
+    
+    def _process_json_data(self, data: Dict, artist_name: str) -> List[Dict]:
+        """Process JSON data to extract show information"""
+        shows = []
+        
+        try:
+            # Recursively search for event-like objects
+            if isinstance(data, dict):
+                for key, value in data.items():
+                    if key.lower() in ['events', 'shows', 'concerts', 'performances']:
+                        if isinstance(value, list):
+                            for item in value:
+                                show = self._extract_show_from_json_item(item, artist_name)
+                                if show:
+                                    shows.append(show)
+                    elif isinstance(value, (dict, list)):
+                        shows.extend(self._process_json_data(value, artist_name))
+            elif isinstance(data, list):
+                for item in data:
+                    shows.extend(self._process_json_data(item, artist_name))
+                    
+        except Exception as e:
+            logger.debug(f"Error processing JSON data: {e}")
+        
+        return shows
+    
+    def _extract_show_from_json_item(self, item: Dict, artist_name: str) -> Optional[Dict]:
+        """Extract show data from a JSON item"""
+        try:
+            if not isinstance(item, dict):
+                return None
+            
+            # Look for venue and date information
+            venue_name = item.get('venue', {}).get('name', '') if isinstance(item.get('venue'), dict) else item.get('venue', '')
+            if not venue_name:
+                venue_name = item.get('location', {}).get('name', '') if isinstance(item.get('location'), dict) else item.get('location', '')
+            
+            date_text = item.get('date', '') or item.get('datetime', '') or item.get('start_time', '')
+            location_text = item.get('address', '') or item.get('city', '')
+            
+            if venue_name and (date_text or location_text):
+                return {
+                    'artist': artist_name,
+                    'venue_name': venue_name,
+                    'raw_location': location_text,
+                    'raw_date': str(date_text),
+                    'source_url': ''
+                }
+            
+            return None
+            
+        except Exception as e:
+            return None
+    
+    def _extract_shows_fallback_selenium(self, artist_name: str) -> List[Dict]:
+        """Fallback method to extract shows using broad selectors"""
+        shows = []
+        
+        try:
+            # Get all text content and try to parse it
+            page_text = self.driver.find_element(By.TAG_NAME, 'body').text
+            
+            # Look for patterns like venue names and dates
+            lines = page_text.split('\n')
+            potential_venues = []
+            
+            for line in lines:
+                line = line.strip()
+                if len(line) > 5 and any(keyword in line.lower() for keyword in ['theater', 'arena', 'club', 'hall', 'center', 'stadium']):
+                    potential_venues.append(line)
+            
+            # Create shows from potential venues
+            for venue in potential_venues[:20]:  # Limit to prevent too many false positives
+                shows.append({
+                    'artist': artist_name,
+                    'venue_name': venue,
+                    'raw_location': '',
+                    'raw_date': '',
+                    'source_url': self.driver.current_url
+                })
+                
+        except Exception as e:
+            logger.debug(f"Fallback extraction error: {e}")
+        
+        return shows
+    
+    def close(self):
+        """Close the WebDriver"""
+        if self.driver:
+            try:
+                self.driver.quit()
+            except:
+                pass
 
 class GoogleMapsAPI:
     def __init__(self, api_key: str):
@@ -73,26 +488,11 @@ class GoogleMapsAPI:
         self.base_url = "https://maps.googleapis.com/maps/api"
         self.session = requests.Session()
     
-    def test_api_key(self) -> bool:
-        try:
-            url = f"{self.base_url}/geocode/json"
-            params = {
-                'address': 'Madison Square Garden, New York, NY',
-                'key': self.api_key
-            }
-            response = self.session.get(url, params=params, timeout=10)
-            data = response.json()
-            return data['status'] == 'OK'
-        except Exception as e:
-            logger.error(f"API key test error: {e}")
-            return False
-    
-    def geocode_venue(self, venue_name: str, city: str, state: str = "", country: str = "USA") -> Optional[Dict]:
-        query = f"{venue_name}, {city}"
-        if state:
-            query += f", {state}"
-        if country:
-            query += f", {country}"
+    def geocode_venue(self, venue_name: str, location: str = "") -> Optional[Dict]:
+        """Geocode a venue with location"""
+        query = venue_name
+        if location:
+            query += f", {location}"
         
         url = f"{self.base_url}/geocode/json"
         params = {
@@ -121,7 +521,8 @@ class GoogleMapsAPI:
             logger.error(f"Error geocoding {query}: {e}")
             return None
     
-    def find_parking_areas(self, latitude: float, longitude: float, radius: int = 500) -> List[ParkingArea]:
+    def find_parking_areas(self, latitude: float, longitude: float, radius: int = 800) -> List[ParkingArea]:
+        """Find parking areas around a venue"""
         url = f"{self.base_url}/place/nearbysearch/json"
         params = {
             'location': f"{latitude},{longitude}",
@@ -155,6 +556,7 @@ class GoogleMapsAPI:
             return []
     
     def _determine_parking_type(self, name: str) -> str:
+        """Determine parking type from name"""
         name_lower = name.lower()
         if 'garage' in name_lower or 'structure' in name_lower:
             return 'garage'
@@ -165,12 +567,13 @@ class GoogleMapsAPI:
 
 class PolygonGenerator:
     def __init__(self):
-        self.earth_radius = 6371000
+        self.earth_radius = 6371000  # Earth's radius in meters
     
-    def generate_venue_polygon(self, venue: Venue, buffer_meters: int = 100) -> Dict:
+    def generate_venue_polygon(self, show: Show, buffer_meters: int = 150) -> Dict:
+        """Generate a polygon around the venue building"""
         try:
             coords = self._create_circular_polygon(
-                venue.latitude, venue.longitude, buffer_meters, points=16
+                show.latitude, show.longitude, buffer_meters, points=20
             )
             return {
                 "type": "Polygon",
@@ -181,15 +584,16 @@ class PolygonGenerator:
             return None
     
     def generate_parking_polygon(self, parking: ParkingArea) -> Dict:
+        """Generate parking area polygon"""
         try:
             if parking.type == 'garage':
-                buffer_meters = 40
+                buffer_meters = 50
                 points = 8
             elif parking.type == 'lot':
-                buffer_meters = 60
+                buffer_meters = 80
                 points = 12
             else:
-                buffer_meters = 15
+                buffer_meters = 20
                 points = 8
             
             coords = self._create_circular_polygon(
@@ -205,6 +609,7 @@ class PolygonGenerator:
             return None
     
     def _create_circular_polygon(self, lat: float, lng: float, radius_meters: int, points: int = 16) -> List[List[float]]:
+        """Create a circular polygon around a point"""
         coords = []
         
         for i in range(points + 1):
@@ -215,531 +620,574 @@ class PolygonGenerator:
             new_lat = lat + delta_lat
             new_lng = lng + delta_lng
             
-            coords.append([new_lng, new_lat])
+            coords.append([new_lng, new_lat])  # GeoJSON format: [longitude, latitude]
         
         return coords
 
-class VenueMapperPro:
-    def __init__(self, api_key: str):
-        self.google_maps = GoogleMapsAPI(api_key)
+class VenueProcessor:
+    def __init__(self, google_api_key: str):
+        self.google_maps = GoogleMapsAPI(google_api_key)
         self.polygon_generator = PolygonGenerator()
+        self.scraper = BandsinTownScraper()
     
-    def create_user(self, email: str, name: str, plan: str = "free") -> User:
-        user_id = str(uuid.uuid4())
-        api_key = hashlib.md5(f"{user_id}{email}".encode()).hexdigest()
-        
-        user = User(
-            id=user_id,
-            email=email,
-            name=name,
-            plan=plan,
-            api_requests=0,
-            created_at=datetime.now().isoformat(),
-            api_key=api_key
-        )
-        
-        users_db[user_id] = user
-        usage_stats["total_users"] += 1
-        return user
-    
-    def get_user_limits(self, plan: str) -> Dict:
-        limits = {
-            "free": {"venues_per_month": 50, "api_requests": 1000, "features": ["basic_geocoding", "csv_export"]},
-            "pro": {"venues_per_month": 500, "api_requests": 10000, "features": ["advanced_geocoding", "all_exports", "api_access", "live_events"]},
-            "enterprise": {"venues_per_month": 5000, "api_requests": 100000, "features": ["unlimited", "priority_support", "custom_integrations"]}
+    def process_artist_urls(self, artist_urls: List[str], load_all_dates: bool = True) -> Tuple[List[Show], Dict]:
+        """Process multiple artist URLs and generate venue polygons"""
+        all_shows = []
+        processing_stats = {
+            "artists_processed": 0,
+            "total_shows_found": 0,
+            "geocoded_shows": 0,
+            "failed_geocoding": 0,
+            "total_polygons": 0
         }
-        return limits.get(plan, limits["free"])
+        
+        try:
+            for url in artist_urls:
+                logger.info(f"Processing artist URL: {url}")
+                processing_stats["artists_processed"] += 1
+                
+                # Scrape shows from the artist page
+                raw_shows = self.scraper.scrape_artist_shows(url, load_all_dates)
+                processing_stats["total_shows_found"] += len(raw_shows)
+                
+                # Process each show
+                for raw_show in raw_shows:
+                    processed_show = self._process_raw_show(raw_show)
+                    if processed_show:
+                        all_shows.append(processed_show)
+                        processing_stats["geocoded_shows"] += 1
+                        
+                        # Count polygons
+                        if processed_show.venue_polygon:
+                            processing_stats["total_polygons"] += 1
+                        processing_stats["total_polygons"] += len(processed_show.parking_polygons)
+                    else:
+                        processing_stats["failed_geocoding"] += 1
+                
+                # Rate limiting between artists
+                time.sleep(2)
+            
+        finally:
+            # Clean up scraper
+            self.scraper.close()
+        
+        return all_shows, processing_stats
     
-    def process_venues_for_user(self, user_id: str, venues_data: List[Dict]) -> List[Venue]:
-        user = users_db.get(user_id)
-        if not user:
-            raise ValueError("User not found")
-        
-        limits = self.get_user_limits(user.plan)
-        if len(venues_data) > limits["venues_per_month"]:
-            raise ValueError(f"Venue limit exceeded. {user.plan} plan allows {limits['venues_per_month']} venues per month")
-        
-        processed_venues = []
-        
-        for venue_data in venues_data:
-            geocode_result = self.google_maps.geocode_venue(
-                venue_data.get('name', ''), 
-                venue_data.get('city', ''), 
-                venue_data.get('state', '')
-            )
+    def _process_raw_show(self, raw_show: Dict) -> Optional[Show]:
+        """Process a raw show dict into a Show object with polygons"""
+        try:
+            # Parse location
+            city, state, country = self._parse_location(raw_show.get('raw_location', ''))
+            
+            # Parse date
+            parsed_date = self._parse_date(raw_show.get('raw_date', ''))
+            
+            # Geocode the venue
+            search_query = f"{raw_show['venue_name']}"
+            if city:
+                search_query += f", {city}"
+            if state:
+                search_query += f", {state}"
+            
+            geocode_result = self.google_maps.geocode_venue(raw_show['venue_name'], f"{city}, {state}" if city and state else "")
             
             if not geocode_result:
-                continue
+                logger.warning(f"Failed to geocode: {search_query}")
+                return None
             
-            venue = Venue(
-                name=venue_data.get('name', 'Unknown Venue'),
+            # Create Show object
+            show = Show(
+                artist=raw_show['artist'],
+                venue_name=raw_show['venue_name'],
                 address=geocode_result['formatted_address'],
-                city=venue_data.get('city', ''),
-                state=venue_data.get('state', ''),
-                country=venue_data.get('country', 'USA'),
+                city=city,
+                state=state,
+                country=country,
+                date=parsed_date,
                 latitude=geocode_result['latitude'],
-                longitude=geocode_result['longitude'],
-                date=venue_data.get('date', datetime.now().strftime('%Y-%m-%d')),
-                artist=venue_data.get('artist', ''),
-                user_id=user_id
+                longitude=geocode_result['longitude']
             )
             
-            # Generate polygons
-            venue.venue_polygon = self.polygon_generator.generate_venue_polygon(venue, 100)
+            # Generate venue polygon
+            show.venue_polygon = self.polygon_generator.generate_venue_polygon(show, 150)
             
-            # Find parking areas
-            parking_areas = self.google_maps.find_parking_areas(venue.latitude, venue.longitude, 500)
+            # Find and generate parking polygons
+            parking_areas = self.google_maps.find_parking_areas(show.latitude, show.longitude, 800)
             
-            for parking in parking_areas[:10]:
+            for parking in parking_areas[:15]:  # Limit to 15 parking areas per venue
                 parking_polygon = self.polygon_generator.generate_parking_polygon(parking)
                 if parking_polygon:
-                    venue.parking_polygons.append({
+                    show.parking_polygons.append({
                         'geometry': parking_polygon,
                         'name': parking.name,
                         'parking_type': parking.type,
                         'place_id': parking.place_id
                     })
             
-            processed_venues.append(venue)
-            venues_db[f"{user_id}_{len(venues_db)}"] = venue
+            return show
             
-            # Update usage stats
-            user.api_requests += 1
-            usage_stats["total_venues"] += 1
-            usage_stats["total_requests"] += 1
+        except Exception as e:
+            logger.error(f"Error processing show: {e}")
+            return None
+    
+    def _parse_location(self, location_text: str) -> Tuple[str, str, str]:
+        """Parse location text into city, state, country"""
+        try:
+            if not location_text:
+                return "", "", "USA"
             
-            time.sleep(0.3)  # Rate limiting
+            # Common patterns: "City, ST" or "City, State" or "City, ST, Country"
+            parts = [part.strip() for part in location_text.split(',')]
+            
+            city = parts[0] if parts else ""
+            state = parts[1] if len(parts) > 1 else ""
+            country = parts[2] if len(parts) > 2 else "USA"
+            
+            # Clean up state (convert full state names to abbreviations if needed)
+            if len(state) > 2:
+                state_abbrev = self._get_state_abbreviation(state)
+                if state_abbrev:
+                    state = state_abbrev
+            
+            return city, state, country
+            
+        except Exception as e:
+            logger.warning(f"Error parsing location '{location_text}': {e}")
+            return "", "", "USA"
+    
+    def _parse_date(self, date_text: str) -> str:
+        """Parse date text into ISO format"""
+        try:
+            if not date_text:
+                return datetime.now().strftime('%Y-%m-%d')
+            
+            # Try various date parsing patterns
+            date_patterns = [
+                '%Y-%m-%d',
+                '%m/%d/%Y',
+                '%d/%m/%Y',
+                '%B %d, %Y',
+                '%b %d, %Y',
+                '%Y-%m-%d %H:%M:%S',
+            ]
+            
+            # Clean the date text
+            date_clean = re.sub(r'[^\w\s/:-]', '', date_text).strip()
+            
+            for pattern in date_patterns:
+                try:
+                    parsed_date = datetime.strptime(date_clean, pattern)
+                    return parsed_date.strftime('%Y-%m-%d')
+                except ValueError:
+                    continue
+            
+            # If all parsing fails, try extracting year/month/day with regex
+            year_match = re.search(r'20\d{2}', date_text)
+            if year_match:
+                return f"{year_match.group()}-01-01"  # Default to January 1st
+            
+            return datetime.now().strftime('%Y-%m-%d')
+            
+        except Exception as e:
+            logger.warning(f"Error parsing date '{date_text}': {e}")
+            return datetime.now().strftime('%Y-%m-%d')
+    
+    def _get_state_abbreviation(self, state_name: str) -> Optional[str]:
+        """Convert full state name to abbreviation"""
+        state_map = {
+            'california': 'CA', 'new york': 'NY', 'texas': 'TX', 'florida': 'FL',
+            'illinois': 'IL', 'pennsylvania': 'PA', 'ohio': 'OH', 'georgia': 'GA',
+            'north carolina': 'NC', 'michigan': 'MI', 'new jersey': 'NJ', 'virginia': 'VA',
+            'washington': 'WA', 'arizona': 'AZ', 'massachusetts': 'MA', 'tennessee': 'TN',
+            'indiana': 'IN', 'missouri': 'MO', 'maryland': 'MD', 'wisconsin': 'WI',
+            'colorado': 'CO', 'minnesota': 'MN', 'south carolina': 'SC', 'alabama': 'AL',
+            'louisiana': 'LA', 'kentucky': 'KY', 'oregon': 'OR', 'oklahoma': 'OK',
+            'connecticut': 'CT', 'utah': 'UT', 'iowa': 'IA', 'nevada': 'NV',
+            'arkansas': 'AR', 'mississippi': 'MS', 'kansas': 'KS', 'new mexico': 'NM',
+            'nebraska': 'NE', 'west virginia': 'WV', 'idaho': 'ID', 'hawaii': 'HI',
+            'new hampshire': 'NH', 'maine': 'ME', 'montana': 'MT', 'rhode island': 'RI',
+            'delaware': 'DE', 'south dakota': 'SD', 'north dakota': 'ND', 'alaska': 'AK',
+            'vermont': 'VT', 'wyoming': 'WY'
+        }
+        return state_map.get(state_name.lower())
+    
+    def generate_geojson(self, shows: List[Show]) -> Dict:
+        """Generate GeoJSON from processed shows"""
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [],
+            "metadata": {
+                "generated_at": datetime.now().isoformat(),
+                "total_shows": len(shows),
+                "source": "bandsintown_scraper"
+            }
+        }
         
-        return processed_venues
+        for show in shows:
+            # Add venue polygon
+            if show.venue_polygon:
+                geojson["features"].append({
+                    "type": "Feature",
+                    "geometry": show.venue_polygon,
+                    "properties": {
+                        "type": "venue",
+                        "artist": show.artist,
+                        "venue_name": show.venue_name,
+                        "address": show.address,
+                        "city": show.city,
+                        "state": show.state,
+                        "date": show.date,
+                        "coordinates": f"{show.latitude},{show.longitude}"
+                    }
+                })
+            
+            # Add parking polygons
+            for parking in show.parking_polygons:
+                geojson["features"].append({
+                    "type": "Feature",
+                    "geometry": parking['geometry'],
+                    "properties": {
+                        "type": "parking",
+                        "parking_name": parking['name'],
+                        "parking_type": parking['parking_type'],
+                        "venue_name": show.venue_name,
+                        "artist": show.artist,
+                        "show_date": show.date
+                    }
+                })
+        
+        return geojson
+    
+    def generate_csv(self, shows: List[Show]) -> str:
+        """Generate CSV from processed shows"""
+        csv_lines = [
+            "artist,venue_name,address,city,state,country,date,latitude,longitude,parking_count"
+        ]
+        
+        for show in shows:
+            csv_lines.append(
+                f'"{show.artist}","{show.venue_name}","{show.address}",'
+                f'"{show.city}","{show.state}","{show.country}","{show.date}",'
+                f'{show.latitude},{show.longitude},{len(show.parking_polygons)}'
+            )
+        
+        return "\n".join(csv_lines)
 
-# Professional Dashboard HTML
+# Personal Dashboard HTML
 DASHBOARD_HTML = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>VenueMapper Pro - Professional Venue Data Platform</title>
+    <title>Personal Bandsintown Venue Scraper</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background: #f8fafc; min-height: 100vh; }
-        
-        .navbar { background: #1e293b; color: white; padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
-        .logo { font-size: 1.5rem; font-weight: bold; }
-        .nav-items { display: flex; gap: 2rem; align-items: center; }
-        .nav-link { color: #cbd5e1; text-decoration: none; transition: color 0.2s; }
-        .nav-link:hover { color: white; }
-        
-        .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
-        .hero { text-align: center; margin: 3rem 0; }
-        .hero h1 { font-size: 3rem; font-weight: 700; color: #1e293b; margin-bottom: 1rem; }
-        .hero p { font-size: 1.25rem; color: #64748b; margin-bottom: 2rem; }
-        
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1.5rem; margin: 2rem 0; }
-        .stat-card { background: white; padding: 2rem; border-radius: 1rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border-left: 4px solid #3b82f6; }
-        .stat-number { font-size: 2.5rem; font-weight: bold; color: #3b82f6; }
-        .stat-label { color: #64748b; font-weight: 500; margin-top: 0.5rem; }
-        
-        .section { background: white; padding: 2rem; border-radius: 1rem; margin: 2rem 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        .section h2 { font-size: 1.5rem; font-weight: 600; color: #1e293b; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem; }
-        
-        .btn { background: #3b82f6; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 0.5rem; font-weight: 600; cursor: pointer; transition: all 0.2s; text-decoration: none; display: inline-block; }
-        .btn:hover { background: #2563eb; transform: translateY(-1px); }
-        .btn-success { background: #10b981; }
-        .btn-success:hover { background: #059669; }
-        .btn-warning { background: #f59e0b; }
-        .btn-warning:hover { background: #d97706; }
-        .btn-danger { background: #ef4444; }
-        .btn-danger:hover { background: #dc2626; }
-        
-        .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1rem; margin: 1rem 0; }
-        .form-control { padding: 0.75rem; border: 1px solid #d1d5db; border-radius: 0.5rem; font-size: 1rem; }
-        .form-control:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,0.1); }
-        
-        .pricing-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 2rem; margin: 2rem 0; }
-        .pricing-card { background: white; border: 2px solid #e5e7eb; border-radius: 1rem; padding: 2rem; text-align: center; position: relative; }
-        .pricing-card.featured { border-color: #3b82f6; transform: scale(1.05); }
-        .pricing-card.featured::before { content: "MOST POPULAR"; position: absolute; top: -12px; left: 50%; transform: translateX(-50%); background: #3b82f6; color: white; padding: 0.5rem 1rem; border-radius: 1rem; font-size: 0.875rem; font-weight: 600; }
-        .price { font-size: 3rem; font-weight: bold; color: #1e293b; }
-        .price-period { color: #64748b; }
-        
-        .feature-list { list-style: none; margin: 1.5rem 0; }
-        .feature-list li { padding: 0.5rem 0; display: flex; align-items: center; gap: 0.5rem; }
-        .feature-list li::before { content: "✓"; color: #10b981; font-weight: bold; }
-        
-        .api-section { background: #f1f5f9; padding: 2rem; border-radius: 1rem; margin: 1rem 0; }
-        .code-block { background: #1e293b; color: #cbd5e1; padding: 1rem; border-radius: 0.5rem; font-family: 'Monaco', 'Menlo', monospace; font-size: 0.875rem; overflow-x: auto; }
-        
-        .status-indicator { display: inline-block; width: 0.75rem; height: 0.75rem; border-radius: 50%; margin-right: 0.5rem; }
-        .status-online { background: #10b981; }
-        .status-offline { background: #ef4444; }
-        
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; border-radius: 20px; box-shadow: 0 20px 40px rgba(0,0,0,0.1); overflow: hidden; }
+        .header { background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%); color: white; padding: 30px; text-align: center; }
+        .header h1 { font-size: 2.5em; margin-bottom: 10px; font-weight: 300; }
+        .main-content { padding: 40px; }
+        .section { background: #f8f9fa; padding: 30px; border-radius: 15px; margin-bottom: 30px; border-left: 5px solid #667eea; }
+        .btn { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; padding: 15px 30px; border-radius: 10px; font-size: 16px; font-weight: 600; cursor: pointer; transition: all 0.3s ease; margin: 10px 5px; }
+        .btn:hover { transform: translateY(-2px); box-shadow: 0 10px 25px rgba(102, 126, 234, 0.3); }
+        .btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+        .btn-success { background: linear-gradient(135deg, #28a745 0%, #20c997 100%); }
+        .btn-danger { background: linear-gradient(135deg, #dc3545 0%, #fd7e14 100%); }
+        .url-input { width: 100%; padding: 15px; border: 2px solid #e9ecef; border-radius: 10px; font-size: 16px; margin: 10px 0; }
+        .url-list { background: white; padding: 15px; border-radius: 10px; margin: 10px 0; max-height: 300px; overflow-y: auto; }
+        .url-item { padding: 15px; background: #f8f9fa; margin: 5px 0; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; border-left: 4px solid #667eea; }
+        .remove-btn { background: #dc3545; color: white; border: none; padding: 8px 15px; border-radius: 5px; cursor: pointer; font-size: 14px; }
+        .status-box { padding: 15px; border-radius: 10px; margin: 15px 0; }
+        .status-box.success { background: #d4edda; border: 1px solid #c3e6cb; color: #155724; }
+        .status-box.error { background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
+        .status-box.info { background: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460; }
+        .status-box.warning { background: #fff3cd; border: 1px solid #ffeaa7; color: #856404; }
         .hidden { display: none; }
-        .alert { padding: 1rem; border-radius: 0.5rem; margin: 1rem 0; }
-        .alert-success { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
-        .alert-error { background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
-        .alert-info { background: #eff6ff; color: #1e40af; border: 1px solid #dbeafe; }
-        
-        .venue-item { background: #f8fafc; padding: 1.5rem; margin: 1rem 0; border-radius: 0.5rem; border-left: 4px solid #3b82f6; }
-        .progress-bar { width: 100%; height: 0.5rem; background: #e5e7eb; border-radius: 0.25rem; overflow: hidden; margin: 1rem 0; }
-        .progress-fill { height: 100%; background: #3b82f6; transition: width 0.5s ease; width: 0%; }
+        .progress-bar { width: 100%; height: 20px; background: #e9ecef; border-radius: 10px; overflow: hidden; margin: 10px 0; }
+        .progress-fill { height: 100%; background: linear-gradient(90deg, #667eea, #764ba2); transition: width 0.5s ease; width: 0%; }
+        .show-item { background: white; padding: 15px; margin: 10px 0; border-radius: 8px; border-left: 4px solid #28a745; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0; }
+        .stat-card { background: white; padding: 20px; border-radius: 10px; text-align: center; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .stat-number { font-size: 2em; font-weight: bold; color: #667eea; }
+        .checkbox-option { margin: 10px 0; }
+        .checkbox-option input { margin-right: 10px; }
+        .download-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin: 20px 0; }
+        .download-card { background: white; padding: 20px; border-radius: 10px; border: 2px solid #e9ecef; text-align: center; }
     </style>
 </head>
 <body>
-    <nav class="navbar">
-        <div class="logo">🗺️ VenueMapper Pro</div>
-        <div class="nav-items">
-            <a href="#features" class="nav-link">Features</a>
-            <a href="#pricing" class="nav-link">Pricing</a>
-            <a href="#api" class="nav-link">API</a>
-            <a href="#dashboard" class="nav-link">Dashboard</a>
-            <button class="btn" onclick="showSignup()">Get Started</button>
-        </div>
-    </nav>
-
     <div class="container">
-        <div class="hero">
-            <h1>Professional Venue Data Platform</h1>
-            <p>Transform venue URLs into actionable geographic data with parking polygons, coordinates, and comprehensive analytics</p>
-            <button class="btn" onclick="showDemo()" style="font-size: 1.125rem; padding: 1rem 2rem;">Start Free Trial</button>
+        <div class="header">
+            <h1>🎵 Personal Bandsintown Venue Scraper</h1>
+            <p>Extract venue data and generate polygons from artist tour pages</p>
         </div>
-
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-number" id="totalVenues">0</div>
-                <div class="stat-label">Venues Processed</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number" id="totalUsers">0</div>
-                <div class="stat-label">Active Users</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number" id="totalRequests">0</div>
-                <div class="stat-label">API Requests</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number">99.9%</div>
-                <div class="stat-label">Uptime</div>
-            </div>
-        </div>
-
-        <div id="pricing" class="section">
-            <h2>💰 Pricing Plans</h2>
-            <div class="pricing-grid">
-                <div class="pricing-card">
-                    <h3>Free</h3>
-                    <div class="price">$0<span class="price-period">/month</span></div>
-                    <ul class="feature-list">
-                        <li>50 venues per month</li>
-                        <li>Basic geocoding</li>
-                        <li>CSV export</li>
-                        <li>Email support</li>
-                    </ul>
-                    <button class="btn" onclick="selectPlan('free')">Start Free</button>
-                </div>
-                <div class="pricing-card featured">
-                    <h3>Pro</h3>
-                    <div class="price">$49<span class="price-period">/month</span></div>
-                    <ul class="feature-list">
-                        <li>500 venues per month</li>
-                        <li>Advanced geocoding</li>
-                        <li>All export formats</li>
-                        <li>API access</li>
-                        <li>Live event detection</li>
-                        <li>Priority support</li>
-                    </ul>
-                    <button class="btn" onclick="selectPlan('pro')">Start Pro Trial</button>
-                </div>
-                <div class="pricing-card">
-                    <h3>Enterprise</h3>
-                    <div class="price">$199<span class="price-period">/month</span></div>
-                    <ul class="feature-list">
-                        <li>5000+ venues per month</li>
-                        <li>Unlimited API requests</li>
-                        <li>Custom integrations</li>
-                        <li>Dedicated support</li>
-                        <li>SLA guarantee</li>
-                    </ul>
-                    <button class="btn" onclick="selectPlan('enterprise')">Contact Sales</button>
-                </div>
-            </div>
-        </div>
-
-        <div id="dashboard" class="section">
-            <h2>🎛️ Dashboard</h2>
-            <div class="alert alert-info" id="status">
-                <span class="status-indicator status-online"></span>
-                System Status: <span id="systemStatus">Checking...</span>
-            </div>
+        <div class="main-content">
             
-            <div class="form-grid">
-                <button class="btn" onclick="testSystem()">🧪 Test API Connection</button>
-                <button class="btn btn-success" onclick="showVenueUpload()">📤 Upload Venues</button>
-                <button class="btn btn-warning" onclick="showArtistPortal()">🎤 Artist Portal</button>
-                <button class="btn" onclick="generateAPIKey()">🔑 Generate API Key</button>
+            <div class="section">
+                <h2>🔗 Add Artist URLs</h2>
+                <p>Enter Bandsintown artist URLs to scrape their tour venues:</p>
+                <input type="url" id="urlInput" class="url-input" placeholder="https://www.bandsintown.com/a/12526716-the-new-dove-brothers">
+                <div style="display: flex; gap: 10px; align-items: center; margin: 10px 0;">
+                    <button class="btn" onclick="addUrl()">➕ Add URL</button>
+                    <button class="btn btn-danger" onclick="clearAllUrls()">🗑️ Clear All</button>
+                </div>
+                
+                <div class="checkbox-option">
+                    <label>
+                        <input type="checkbox" id="loadAllDates" checked>
+                        📅 Load all dates (click "Show more dates" automatically)
+                    </label>
+                </div>
+                <div class="checkbox-option">
+                    <label>
+                        <input type="checkbox" id="includeParking" checked>
+                        🅿️ Include parking area polygons
+                    </label>
+                </div>
+                
+                <div id="urlList" class="url-list hidden"></div>
+                <button class="btn btn-success" onclick="startScraping()" id="scrapeBtn" style="font-size: 18px; padding: 20px 40px;">
+                    🚀 Start Scraping & Generate Polygons
+                </button>
             </div>
 
-            <div id="venueUpload" class="hidden api-section">
-                <h3>📤 Bulk Venue Upload</h3>
-                <p>Upload CSV or manually enter venue data:</p>
-                <div class="form-grid">
-                    <input type="file" id="csvFile" class="form-control" accept=".csv">
-                    <button class="btn" onclick="processCsvFile()">Process CSV</button>
+            <div id="processingSection" class="section hidden">
+                <h2>⚡ Processing Status</h2>
+                <div id="status" class="status-box info">Ready to process...</div>
+                <div id="progress" class="progress-bar hidden">
+                    <div id="progressFill" class="progress-fill"></div>
                 </div>
-                <div class="form-grid">
-                    <input type="text" id="venueName" class="form-control" placeholder="Venue Name">
-                    <input type="text" id="venueCity" class="form-control" placeholder="City, State">
-                    <input type="date" id="venueDate" class="form-control">
-                    <button class="btn btn-success" onclick="addSingleVenue()">Add Venue</button>
-                </div>
-                <div id="venueList" class="hidden"></div>
-                <button class="btn btn-success" onclick="processAllVenues()" id="processBtn" class="hidden">🚀 Process All Venues</button>
+                <div id="processingDetails" class="hidden"></div>
             </div>
 
-            <div id="results" class="hidden"></div>
-            <div id="downloadSection" class="hidden">
-                <h3>📥 Download Results</h3>
-                <div class="form-grid">
-                    <button class="btn btn-success" onclick="downloadGeojson()">🗺️ GeoJSON</button>
-                    <button class="btn btn-success" onclick="downloadCSV()">📊 CSV</button>
-                    <button class="btn btn-success" onclick="downloadJSON()">📋 JSON</button>
+            <div id="resultsSection" class="section hidden">
+                <h2>📊 Processing Results</h2>
+                <div id="statsGrid" class="stats-grid"></div>
+                <div id="showsList" class="hidden"></div>
+            </div>
+
+            <div id="downloadSection" class="section hidden">
+                <h2>📥 Download Your Data</h2>
+                <div class="download-grid">
+                    <div class="download-card">
+                        <h4>🗺️ GeoJSON File</h4>
+                        <p>Venue & parking polygons for mapping</p>
+                        <button class="btn btn-success" onclick="downloadGeojson()">Download GeoJSON</button>
+                    </div>
+                    <div class="download-card">
+                        <h4>📊 CSV Data</h4>
+                        <p>Venue data for spreadsheets</p>
+                        <button class="btn btn-success" onclick="downloadCSV()">Download CSV</button>
+                    </div>
+                    <div class="download-card">
+                        <h4>📋 JSON Report</h4>
+                        <p>Complete processing report</p>
+                        <button class="btn btn-success" onclick="downloadJSON()">Download JSON</button>
+                    </div>
                 </div>
             </div>
 
-            <div class="progress-bar hidden" id="progress">
-                <div class="progress-fill" id="progressFill"></div>
-            </div>
-        </div>
-
-        <div id="api" class="section">
-            <h2>🔌 API Documentation</h2>
-            <div class="api-section">
-                <h3>Authentication</h3>
-                <p>Include your API key in the header:</p>
-                <div class="code-block">
-                    <pre>curl -H "X-API-Key: your_api_key_here" \\
-     -H "Content-Type: application/json" \\
-     -d '{"venues": [{"name": "Madison Square Garden", "city": "New York, NY"}]}' \\
-     https://your-domain.com/api/process-venues</pre>
+            <div class="section">
+                <h2>ℹ️ How It Works</h2>
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; margin: 20px 0;">
+                    <div style="background: white; padding: 20px; border-radius: 10px;">
+                        <h4>1. 🕷️ Web Scraping</h4>
+                        <p>Automatically scrapes Bandsintown artist pages, clicking "Show more dates" to load all historical shows</p>
+                    </div>
+                    <div style="background: white; padding: 20px; border-radius: 10px;">
+                        <h4>2. 📍 Geocoding</h4>
+                        <p>Converts venue names and addresses to precise GPS coordinates using Google Maps API</p>
+                    </div>
+                    <div style="background: white; padding: 20px; border-radius: 10px;">
+                        <h4>3. 🗺️ Polygon Generation</h4>
+                        <p>Creates venue building polygons and finds nearby parking areas with their own polygons</p>
+                    </div>
+                    <div style="background: white; padding: 20px; border-radius: 10px;">
+                        <h4>4. 📤 Data Export</h4>
+                        <p>Delivers GeoJSON files ready for mapping software, plus CSV for analysis</p>
+                    </div>
                 </div>
-            </div>
-            
-            <div class="api-section">
-                <h3>Endpoints</h3>
-                <ul class="feature-list">
-                    <li><strong>POST /api/process-venues</strong> - Process venue data</li>
-                    <li><strong>GET /api/user-stats</strong> - Get usage statistics</li>
-                    <li><strong>POST /api/live-events</strong> - Find live events</li>
-                    <li><strong>GET /api/export/{format}</strong> - Export data</li>
-                </ul>
             </div>
         </div>
     </div>
 
     <script>
-        let venueQueue = [];
+        let artistUrls = [];
         let processedData = null;
-        let currentUser = null;
 
-        async function testSystem() {
-            updateStatus('🔍 Testing system connection...', 'info');
+        function addUrl() {
+            const input = document.getElementById('urlInput');
+            const url = input.value.trim();
             
-            try {
-                const response = await fetch('/api/system-status');
-                const data = await response.json();
-                
-                if (data.success) {
-                    updateStatus('✅ System operational', 'success');
-                    document.getElementById('systemStatus').textContent = 'Online';
-                } else {
-                    updateStatus('❌ System error: ' + data.error, 'error');
-                    document.getElementById('systemStatus').textContent = 'Error';
+            if (!url) {
+                alert('Please enter a URL');
+                return;
+            }
+            
+            if (!url.includes('bandsintown.com/a/')) {
+                if (!confirm('This doesn\'t look like a Bandsintown artist URL. Add anyway?')) {
+                    return;
                 }
-            } catch (error) {
-                updateStatus('❌ Connection failed: ' + error.message, 'error');
-                document.getElementById('systemStatus').textContent = 'Offline';
+            }
+            
+            if (artistUrls.includes(url)) {
+                alert('This URL is already in the list');
+                return;
+            }
+            
+            artistUrls.push(url);
+            input.value = '';
+            updateUrlDisplay();
+            showStatus(`Added artist URL. Total: ${artistUrls.length}`, 'info');
+        }
+        
+        function removeUrl(index) {
+            artistUrls.splice(index, 1);
+            updateUrlDisplay();
+            showStatus(`Removed URL. Total: ${artistUrls.length}`, 'info');
+        }
+        
+        function clearAllUrls() {
+            if (artistUrls.length === 0) return;
+            if (confirm(`Clear all ${artistUrls.length} URLs?`)) {
+                artistUrls = [];
+                updateUrlDisplay();
+                showStatus('All URLs cleared', 'info');
             }
         }
-
-        function updateStatus(message, type) {
-            const status = document.getElementById('status');
-            status.className = `alert alert-${type}`;
-            status.innerHTML = `<span class="status-indicator status-${type === 'success' ? 'online' : 'offline'}"></span>${message}`;
+        
+        function updateUrlDisplay() {
+            const container = document.getElementById('urlList');
+            if (artistUrls.length === 0) {
+                container.classList.add('hidden');
+                return;
+            }
+            
+            container.classList.remove('hidden');
+            container.innerHTML = artistUrls.map((url, index) => {
+                // Extract artist name from URL
+                const match = url.match(/\/a\/\d+-(.+)/);
+                const artistName = match ? match[1].replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) : 'Unknown Artist';
+                
+                return `
+                    <div class="url-item">
+                        <div>
+                            <strong>${artistName}</strong><br>
+                            <small>${url}</small>
+                        </div>
+                        <button class="remove-btn" onclick="removeUrl(${index})">Remove</button>
+                    </div>
+                `;
+            }).join('');
         }
 
+        function showStatus(message, type) {
+            const status = document.getElementById('status');
+            status.className = `status-box ${type}`;
+            status.innerHTML = message;
+            document.getElementById('processingSection').classList.remove('hidden');
+        }
+        
         function updateProgress(percentage) {
             const progress = document.getElementById('progress');
             const fill = document.getElementById('progressFill');
             progress.classList.remove('hidden');
             fill.style.width = percentage + '%';
         }
-
-        function showDemo() {
-            document.getElementById('dashboard').scrollIntoView({ behavior: 'smooth' });
-            updateStatus('👋 Welcome! Test the platform with the buttons below.', 'info');
-        }
-
-        function showSignup() {
-            const email = prompt('Enter your email to get started:');
-            const name = prompt('Enter your name:');
-            
-            if (email && name) {
-                signupUser(email, name, 'free');
+        
+        async function startScraping() {
+            if (artistUrls.length === 0) {
+                alert('Please add at least one artist URL');
+                return;
             }
-        }
-
-        async function signupUser(email, name, plan) {
+            
+            const loadAllDates = document.getElementById('loadAllDates').checked;
+            const includeParking = document.getElementById('includeParking').checked;
+            
+            showStatus('🕷️ Starting web scraping process...', 'info');
+            updateProgress(10);
+            
             try {
-                const response = await fetch('/api/signup', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ email, name, plan })
-                });
-                
-                const data = await response.json();
-                if (data.success) {
-                    currentUser = data.user;
-                    updateStatus(`🎉 Welcome ${name}! Your ${plan} account is ready.`, 'success');
-                    loadStats();
-                } else {
-                    updateStatus('❌ Signup failed: ' + data.error, 'error');
-                }
-            } catch (error) {
-                updateStatus('❌ Signup error: ' + error.message, 'error');
-            }
-        }
-
-        function selectPlan(plan) {
-            const email = prompt('Enter your email:');
-            const name = prompt('Enter your name:');
-            
-            if (email && name) {
-                signupUser(email, name, plan);
-            }
-        }
-
-        function showVenueUpload() {
-            document.getElementById('venueUpload').classList.remove('hidden');
-        }
-
-        function addSingleVenue() {
-            const name = document.getElementById('venueName').value.trim();
-            const city = document.getElementById('venueCity').value.trim();
-            const date = document.getElementById('venueDate').value;
-            
-            if (!name || !city) {
-                alert('Please enter venue name and city');
-                return;
-            }
-            
-            venueQueue.push({ name, city, date: date || new Date().toISOString().slice(0, 10) });
-            updateVenueList();
-            
-            // Clear form
-            document.getElementById('venueName').value = '';
-            document.getElementById('venueCity').value = '';
-            document.getElementById('venueDate').value = '';
-        }
-
-        function updateVenueList() {
-            const container = document.getElementById('venueList');
-            if (venueQueue.length === 0) {
-                container.classList.add('hidden');
-                document.getElementById('processBtn').classList.add('hidden');
-                return;
-            }
-            
-            container.classList.remove('hidden');
-            document.getElementById('processBtn').classList.remove('hidden');
-            
-            container.innerHTML = '<h4>📋 Venues to Process:</h4>' + 
-                venueQueue.map((venue, index) => `
-                    <div class="venue-item">
-                        <strong>${venue.name}</strong> - ${venue.city} (${venue.date})
-                        <button class="btn btn-danger" onclick="removeVenue(${index})" style="float: right; padding: 0.25rem 0.5rem;">Remove</button>
-                    </div>
-                `).join('');
-        }
-
-        function removeVenue(index) {
-            venueQueue.splice(index, 1);
-            updateVenueList();
-        }
-
-        async function processAllVenues() {
-            if (venueQueue.length === 0) {
-                alert('No venues to process');
-                return;
-            }
-
-            updateStatus(`🚀 Processing ${venueQueue.length} venues...`, 'info');
-            updateProgress(20);
-
-            try {
-                const response = await fetch('/api/process-venues', {
+                const response = await fetch('/api/scrape-artists', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ 
-                        venues: venueQueue,
-                        user_id: currentUser?.id 
+                        urls: artistUrls,
+                        load_all_dates: loadAllDates,
+                        include_parking: includeParking
                     })
                 });
-
-                updateProgress(80);
+                
+                updateProgress(30);
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                
                 const data = await response.json();
                 updateProgress(100);
-
-                if (data.success) {
-                    processedData = data;
-                    updateStatus(`🎉 Success! Processed ${data.venues.length} venues with ${data.total_polygons} polygons.`, 'success');
-                    displayResults(data.venues);
-                    document.getElementById('downloadSection').classList.remove('hidden');
-                    venueQueue = [];
-                    updateVenueList();
-                    loadStats();
-                } else {
-                    updateStatus('❌ Processing failed: ' + data.error, 'error');
-                }
-            } catch (error) {
-                updateStatus('❌ Processing error: ' + error.message, 'error');
-            }
-        }
-
-        function displayResults(venues) {
-            const results = document.getElementById('results');
-            results.innerHTML = '<h3>📍 Processed Venues:</h3>';
-            
-            venues.forEach(venue => {
-                const item = document.createElement('div');
-                item.className = 'venue-item';
-                item.innerHTML = `
-                    <strong>${venue.name}</strong><br>
-                    📍 ${venue.address}<br>
-                    🗺️ (${venue.latitude.toFixed(6)}, ${venue.longitude.toFixed(6)})<br>
-                    🅿️ ${venue.parking_count} parking areas<br>
-                    📅 ${venue.date}
-                `;
-                results.appendChild(item);
-            });
-            
-            results.classList.remove('hidden');
-        }
-
-        async function loadStats() {
-            try {
-                const response = await fetch('/api/stats');
-                const data = await response.json();
                 
                 if (data.success) {
-                    document.getElementById('totalVenues').textContent = data.stats.total_venues;
-                    document.getElementById('totalUsers').textContent = data.stats.total_users;
-                    document.getElementById('totalRequests').textContent = data.stats.total_requests;
+                    processedData = data;
+                    showStatus(`🎉 Success! Processed ${data.stats.total_shows_found} shows from ${data.stats.artists_processed} artists`, 'success');
+                    displayResults(data);
+                    document.getElementById('downloadSection').classList.remove('hidden');
+                } else {
+                    showStatus('❌ Scraping failed: ' + data.error, 'error');
                 }
             } catch (error) {
-                console.error('Failed to load stats:', error);
+                showStatus('❌ Error: ' + error.message, 'error');
+                updateProgress(0);
             }
         }
-
+        
+        function displayResults(data) {
+            // Show statistics
+            const statsGrid = document.getElementById('statsGrid');
+            statsGrid.innerHTML = `
+                <div class="stat-card">
+                    <div class="stat-number">${data.stats.artists_processed}</div>
+                    <div>Artists Processed</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number">${data.stats.total_shows_found}</div>
+                    <div>Shows Found</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number">${data.stats.geocoded_shows}</div>
+                    <div>Successfully Geocoded</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number">${data.stats.total_polygons}</div>
+                    <div>Total Polygons</div>
+                </div>
+            `;
+            
+            // Show individual shows
+            const showsList = document.getElementById('showsList');
+            if (data.shows && data.shows.length > 0) {
+                showsList.innerHTML = '<h3>📍 Processed Shows:</h3>' + 
+                    data.shows.slice(0, 10).map(show => `
+                        <div class="show-item">
+                            <strong>${show.artist}</strong> at <strong>${show.venue_name}</strong><br>
+                            📍 ${show.address}<br>
+                            📅 ${show.date}<br>
+                            🗺️ ${show.latitude.toFixed(6)}, ${show.longitude.toFixed(6)}<br>
+                            🅿️ ${show.parking_count} parking areas found
+                        </div>
+                    `).join('');
+                
+                if (data.shows.length > 10) {
+                    showsList.innerHTML += `<p><em>... and ${data.shows.length - 10} more shows</em></p>`;
+                }
+                
+                showsList.classList.remove('hidden');
+            }
+            
+            document.getElementById('resultsSection').classList.remove('hidden');
+        }
+        
         function downloadGeojson() {
             if (!processedData) return alert('No data to download');
             
@@ -747,11 +1195,11 @@ DASHBOARD_HTML = '''
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = `venues_${new Date().toISOString().slice(0,10)}.geojson`;
+            a.download = `bandsintown_venues_${new Date().toISOString().slice(0,10)}.geojson`;
             a.click();
             URL.revokeObjectURL(url);
         }
-
+        
         function downloadCSV() {
             if (!processedData) return alert('No data to download');
             
@@ -759,370 +1207,99 @@ DASHBOARD_HTML = '''
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = `venues_${new Date().toISOString().slice(0,10)}.csv`;
+            a.download = `bandsintown_venues_${new Date().toISOString().slice(0,10)}.csv`;
             a.click();
             URL.revokeObjectURL(url);
         }
-
+        
         function downloadJSON() {
             if (!processedData) return alert('No data to download');
             
-            const blob = new Blob([JSON.stringify(processedData, null, 2)], { type: 'application/json' });
+            const report = {
+                metadata: {
+                    generated_at: new Date().toISOString(),
+                    source: 'bandsintown_scraper',
+                    total_artists: processedData.stats.artists_processed,
+                    total_shows: processedData.stats.geocoded_shows
+                },
+                statistics: processedData.stats,
+                shows: processedData.shows
+            };
+            
+            const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = `venues_${new Date().toISOString().slice(0,10)}.json`;
+            a.download = `bandsintown_report_${new Date().toISOString().slice(0,10)}.json`;
             a.click();
             URL.revokeObjectURL(url);
         }
-
-        function generateAPIKey() {
-            if (!currentUser) {
-                alert('Please sign up first');
-                return;
+        
+        // Allow Enter key to add URLs
+        document.getElementById('urlInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                addUrl();
             }
-            
-            updateStatus(`🔑 Your API Key: ${currentUser.api_key}`, 'success');
-        }
-
-        function showArtistPortal() {
-            window.open(window.location.origin + '/artist-portal', '_blank');
-        }
-
-        // Load stats on page load
-        window.addEventListener('load', () => {
-            setTimeout(() => {
-                testSystem();
-                loadStats();
-            }, 1000);
         });
     </script>
 </body>
 </html>
 '''
 
-# API Routes
+# Flask Routes
 @app.route('/')
 def dashboard():
     return render_template_string(DASHBOARD_HTML)
 
-@app.route('/artist-portal')
-def artist_portal():
-    return render_template_string('''
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Artist Portal - VenueMapper Pro</title>
-        <style>
-            * { margin: 0; padding: 0; box-sizing: border-box; }
-            body { font-family: 'Inter', sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 2rem; }
-            .container { max-width: 800px; margin: 0 auto; background: white; border-radius: 1rem; box-shadow: 0 20px 40px rgba(0,0,0,0.1); overflow: hidden; }
-            .header { background: #1e293b; color: white; padding: 2rem; text-align: center; }
-            .form-section { padding: 2rem; }
-            .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1rem 0; }
-            .form-control { padding: 0.75rem; border: 1px solid #d1d5db; border-radius: 0.5rem; font-size: 1rem; }
-            .btn { background: #3b82f6; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 0.5rem; font-weight: 600; cursor: pointer; }
-            .btn:hover { background: #2563eb; }
-            .venue-item { background: #f8fafc; padding: 1rem; margin: 0.5rem 0; border-radius: 0.5rem; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h1>🎤 Artist Tour Submission</h1>
-                <p>Submit your tour venues for professional mapping</p>
-            </div>
-            <div class="form-section">
-                <h3>Artist Information</h3>
-                <div class="form-grid">
-                    <input type="text" id="artistName" class="form-control" placeholder="Artist/Band Name" required>
-                    <input type="email" id="artistEmail" class="form-control" placeholder="Contact Email" required>
-                </div>
-                
-                <h3 style="margin-top: 2rem;">Tour Venues</h3>
-                <div class="form-grid">
-                    <input type="text" id="venueName" class="form-control" placeholder="Venue Name">
-                    <input type="text" id="venueCity" class="form-control" placeholder="City, State">
-                </div>
-                <div class="form-grid">
-                    <input type="datetime-local" id="showDate" class="form-control">
-                    <button class="btn" onclick="addVenue()">Add Venue</button>
-                </div>
-                
-                <div id="venueList"></div>
-                
-                <div style="text-align: center; margin-top: 2rem;">
-                    <button class="btn" onclick="submitTour()" style="font-size: 1.125rem; padding: 1rem 2rem;">🚀 Submit Tour</button>
-                </div>
-            </div>
-        </div>
-
-        <script>
-            let tourVenues = [];
-
-            function addVenue() {
-                const name = document.getElementById('venueName').value.trim();
-                const city = document.getElementById('venueCity').value.trim();
-                const date = document.getElementById('showDate').value;
-
-                if (!name || !city || !date) {
-                    alert('Please fill all venue fields');
-                    return;
-                }
-
-                tourVenues.push({ name, city, date });
-                updateVenueDisplay();
-                
-                // Clear form
-                document.getElementById('venueName').value = '';
-                document.getElementById('venueCity').value = '';
-                document.getElementById('showDate').value = '';
-            }
-
-            function updateVenueDisplay() {
-                const container = document.getElementById('venueList');
-                container.innerHTML = tourVenues.map((venue, index) => `
-                    <div class="venue-item">
-                        <strong>${venue.name}</strong> - ${venue.city}<br>
-                        📅 ${new Date(venue.date).toLocaleDateString()} at ${new Date(venue.date).toLocaleTimeString()}
-                        <button onclick="removeVenue(${index})" style="float: right;">Remove</button>
-                    </div>
-                `).join('');
-            }
-
-            function removeVenue(index) {
-                tourVenues.splice(index, 1);
-                updateVenueDisplay();
-            }
-
-            async function submitTour() {
-                const artistName = document.getElementById('artistName').value.trim();
-                const artistEmail = document.getElementById('artistEmail').value.trim();
-
-                if (!artistName || !artistEmail) {
-                    alert('Please enter artist name and email');
-                    return;
-                }
-
-                if (tourVenues.length === 0) {
-                    alert('Please add at least one venue');
-                    return;
-                }
-
-                try {
-                    const response = await fetch('/api/artist-submission', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            artist: { name: artistName, email: artistEmail },
-                            venues: tourVenues
-                        })
-                    });
-
-                    const data = await response.json();
-                    if (data.success) {
-                        alert(`Thank you ${artistName}! Your tour has been submitted successfully.`);
-                        // Reset form
-                        document.getElementById('artistName').value = '';
-                        document.getElementById('artistEmail').value = '';
-                        tourVenues = [];
-                        updateVenueDisplay();
-                    } else {
-                        alert('Submission failed: ' + data.error);
-                    }
-                } catch (error) {
-                    alert('Error: ' + error.message);
-                }
-            }
-        </script>
-    </body>
-    </html>
-    ''')
-
-@app.route('/api/signup', methods=['POST'])
-def signup():
-    try:
-        data = request.get_json()
-        email = data.get('email')
-        name = data.get('name') 
-        plan = data.get('plan', 'free')
-        
-        if not email or not name:
-            return jsonify({'success': False, 'error': 'Email and name required'})
-        
-        # Check if user exists
-        for user in users_db.values():
-            if user.email == email:
-                return jsonify({'success': False, 'error': 'Email already registered'})
-        
-        mapper = VenueMapperPro(os.environ.get('GOOGLE_MAPS_API_KEY', ''))
-        user = mapper.create_user(email, name, plan)
-        
-        return jsonify({
-            'success': True,
-            'user': {
-                'id': user.id,
-                'email': user.email,
-                'name': user.name,
-                'plan': user.plan,
-                'api_key': user.api_key
-            }
-        })
-        
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/api/system-status', methods=['GET'])
-def system_status():
+@app.route('/api/scrape-artists', methods=['POST'])
+def scrape_artists():
     try:
         api_key = os.environ.get('GOOGLE_MAPS_API_KEY')
         if not api_key:
-            return jsonify({'success': False, 'error': 'API key not configured'})
-        
-        mapper = VenueMapperPro(api_key)
-        if mapper.google_maps.test_api_key():
-            return jsonify({'success': True, 'status': 'operational'})
-        else:
-            return jsonify({'success': False, 'error': 'API key validation failed'})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/api/stats', methods=['GET'])
-def get_stats():
-    return jsonify({'success': True, 'stats': usage_stats})
-
-@app.route('/api/process-venues', methods=['POST'])
-def process_venues():
-    try:
-        api_key = os.environ.get('GOOGLE_MAPS_API_KEY')
-        if not api_key:
-            return jsonify({'success': False, 'error': 'API key not configured'})
+            return jsonify({'success': False, 'error': 'Google Maps API key not configured'})
         
         data = request.get_json()
-        venues_data = data.get('venues', [])
-        user_id = data.get('user_id', 'anonymous')
+        urls = data.get('urls', [])
+        load_all_dates = data.get('load_all_dates', True)
+        include_parking = data.get('include_parking', True)
         
-        if not venues_data:
-            return jsonify({'success': False, 'error': 'No venues provided'})
+        if not urls:
+            return jsonify({'success': False, 'error': 'No URLs provided'})
         
-        mapper = VenueMapperPro(api_key)
+        # Process the artist URLs
+        processor = VenueProcessor(api_key)
+        shows, stats = processor.process_artist_urls(urls, load_all_dates)
         
-        # Create anonymous user if needed
-        if user_id == 'anonymous':
-            user = mapper.create_user('anonymous@example.com', 'Anonymous User', 'free')
-            user_id = user.id
-        
-        venues = mapper.process_venues_for_user(user_id, venues_data)
-        
-        if not venues:
-            return jsonify({'success': False, 'error': 'No venues could be processed'})
+        if not shows:
+            return jsonify({'success': False, 'error': 'No shows could be processed from the provided URLs'})
         
         # Generate outputs
-        geojson_data = {
-            "type": "FeatureCollection",
-            "features": [],
-            "metadata": {
-                "generated_at": datetime.now().isoformat(),
-                "venue_count": len(venues),
-                "user_id": user_id
-            }
-        }
-        
-        total_polygons = 0
-        
-        for venue in venues:
-            if venue.venue_polygon:
-                geojson_data["features"].append({
-                    "type": "Feature",
-                    "geometry": venue.venue_polygon,
-                    "properties": {
-                        "type": "venue",
-                        "name": venue.name,
-                        "address": venue.address,
-                        "city": venue.city,
-                        "state": venue.state,
-                        "date": venue.date
-                    }
-                })
-                total_polygons += 1
-            
-            for parking in venue.parking_polygons:
-                geojson_data["features"].append({
-                    "type": "Feature",
-                    "geometry": parking['geometry'],
-                    "properties": {
-                        "type": "parking",
-                        "name": parking['name'],
-                        "parking_type": parking['parking_type'],
-                        "venue_name": venue.name
-                    }
-                })
-                total_polygons += 1
-        
-        # Generate CSV
-        csv_lines = ["venue_name,address,city,state,latitude,longitude,date,parking_count"]
-        for venue in venues:
-            csv_lines.append(f'"{venue.name}","{venue.address}","{venue.city}","{venue.state}",'
-                           f'{venue.latitude},{venue.longitude},"{venue.date}",{len(venue.parking_polygons)}')
-        csv_content = "\n".join(csv_lines)
+        geojson = processor.generate_geojson(shows)
+        csv_content = processor.generate_csv(shows)
         
         return jsonify({
             'success': True,
-            'venues': [
+            'stats': stats,
+            'shows': [
                 {
-                    'name': v.name,
-                    'address': v.address,
-                    'city': v.city,
-                    'state': v.state,
-                    'latitude': v.latitude,
-                    'longitude': v.longitude,
-                    'date': v.date,
-                    'parking_count': len(v.parking_polygons)
+                    'artist': show.artist,
+                    'venue_name': show.venue_name,
+                    'address': show.address,
+                    'city': show.city,
+                    'state': show.state,
+                    'date': show.date,
+                    'latitude': show.latitude,
+                    'longitude': show.longitude,
+                    'parking_count': len(show.parking_polygons)
                 }
-                for v in venues
+                for show in shows
             ],
-            'total_polygons': total_polygons,
-            'geojson': geojson_data,
+            'geojson': geojson,
             'csv': csv_content
         })
         
     except Exception as e:
-        logger.error(f"Processing error: {e}")
-        return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/api/artist-submission', methods=['POST'])
-def artist_submission():
-    try:
-        data = request.get_json()
-        artist = data.get('artist', {})
-        venues = data.get('venues', [])
-        
-        if not artist.get('name') or not artist.get('email'):
-            return jsonify({'success': False, 'error': 'Artist name and email required'})
-        
-        if not venues:
-            return jsonify({'success': False, 'error': 'At least one venue required'})
-        
-        submission_id = str(uuid.uuid4())
-        artist_submissions[submission_id] = {
-            'id': submission_id,
-            'artist': artist,
-            'venues': venues,
-            'submitted_at': datetime.now().isoformat(),
-            'status': 'pending'
-        }
-        
-        logger.info(f"Artist submission from {artist['name']} with {len(venues)} venues")
-        
-        return jsonify({
-            'success': True,
-            'submission_id': submission_id,
-            'venue_count': len(venues)
-        })
-        
-    except Exception as e:
+        logger.error(f"Scraping error: {e}")
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/health', methods=['GET'])
