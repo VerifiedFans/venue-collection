@@ -2,7 +2,7 @@ flask
 gunicorn
 requests
 beautifulsoup4
-google-maps-services
+googlemaps
 selenium
 pandas
 geopandas
