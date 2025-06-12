@@ -1,6 +1,9 @@
-requests
-beautifulsoup4
-selenium
-google-maps-services
 flask
 gunicorn
+requests
+beautifulsoup4
+google-maps-services
+selenium
+pandas
+geopandas
+shapely
