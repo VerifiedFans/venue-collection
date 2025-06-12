@@ -3,5 +3,3 @@ gunicorn
 requests
 beautifulsoup4
 googlemaps
-selenium
-pandas
